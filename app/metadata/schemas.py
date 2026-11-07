@@ -39,3 +39,9 @@ class ProjectMetadataResponse(BaseModel):
     summary: MetadataSummary
     results: list[dict] = Field(default_factory=list)
     errors: list[MetadataError] = Field(default_factory=list)
+
+
+class ASTMetadataRequest(BaseModel):
+    project_id: str = Field(..., min_length=1)
+    analysis_id: str = Field(..., min_length=1)
+    artifact_id: str = Field(..., min_length=1)

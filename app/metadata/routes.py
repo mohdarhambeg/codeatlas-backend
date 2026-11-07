@@ -1,4 +1,8 @@
+import httpx
 
+from app.metadata.schemas import ASTMetadataRequest
+from app.metadata.ast_client import ASTClient
+from app.metadata.extractor import extract_metadata_from_ast
 from fastapi import APIRouter, HTTPException
 
 from app.metadata.schemas import (
@@ -14,6 +18,7 @@ router = APIRouter(
     prefix="/api/v1/metadata",
     tags=["Metadata"],
 )
+ast_client = ASTClient()
 
 
 @router.post("/extract")
@@ -67,4 +72,45 @@ def scan_project_endpoint(request: ProjectScanRequest):
         raise HTTPException(
             status_code=403,
             detail="Permission denied while accessing the project folder.",
+        )
+
+
+@router.post("/extract-from-ast")
+async def extract_metadata_from_ast_endpoint(
+    request: ASTMetadataRequest,
+):
+    """Extract metadata using AST from the TypeScript backend."""
+
+    try:
+        # Step 1: Retrieve AST document.
+        ast_document = await ast_client.get_ast_document(
+            request.project_id,
+            request.analysis_id,
+            request.artifact_id,
+        )
+
+        # Step 2: Extract metadata from AST.
+        metadata = extract_metadata_from_ast(ast_document)
+
+        return {
+            "status": "success",
+            "metadata": metadata,
+        }
+
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(
+            status_code=error.response.status_code,
+            detail="Failed to retrieve AST document from TypeScript backend.",
+        )
+
+    except httpx.RequestError:
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot connect to the TypeScript backend.",
+        )
+
+    except (ValueError, KeyError, TypeError) as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Metadata extraction failed: {error}",
         )
