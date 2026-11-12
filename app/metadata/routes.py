@@ -1,9 +1,12 @@
-import httpx
+import logging
 
 from app.metadata.schemas import ASTMetadataRequest
-from app.metadata.ast_client import ASTClient
-from app.metadata.extractor import extract_metadata_from_ast
-from fastapi import APIRouter, HTTPException
+from app.metadata.ast_client import ASTClient, ASTRequestError, UpstreamError
+from app.metadata.extractor import legacy_metadata
+from app.metadata.validation import ASTValidationError, UnsupportedLanguageError
+from app.metadata.schemas import MetadataDocumentResponse
+from app.metadata.service import retrieve_ast_metadata
+from fastapi import APIRouter, HTTPException, Depends
 
 from app.metadata.schemas import (
     MetadataRequest,
@@ -18,7 +21,12 @@ router = APIRouter(
     prefix="/api/v1/metadata",
     tags=["Metadata"],
 )
-ast_client = ASTClient()
+v2_router = APIRouter(prefix="/api/v2/metadata", tags=["Metadata v2"])
+logger = logging.getLogger(__name__)
+
+
+def get_ast_client():
+    return ASTClient()
 
 
 @router.post("/extract")
@@ -33,23 +41,26 @@ def extract_metadata_endpoint(request: MetadataRequest):
             "metadata": result,
         }
 
-    except FileNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error))
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Python file was not found.")
 
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error))
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="The file is not valid UTF-8 text.")
+
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path or unsupported file type.")
 
     except SyntaxError as error:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid Python syntax: {error}",
+            detail=f"Invalid Python syntax at line {error.lineno}.",
         )
 
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="The file is not valid UTF-8 text.",
-        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Permission denied while accessing the file.")
+
+    except OSError:
+        raise HTTPException(status_code=400, detail="Cannot read the Python file.")
 
 
 @router.post(
@@ -62,11 +73,14 @@ def scan_project_endpoint(request: ProjectScanRequest):
     try:
         return scan_project(request.project_path)
 
-    except NotADirectoryError as error:
-        raise HTTPException(status_code=404, detail=str(error))
+    except NotADirectoryError:
+        raise HTTPException(status_code=404, detail="Project folder was not found.")
 
-    except ValueError as error:
-        raise HTTPException(status_code=400, detail=str(error))
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="The file is not valid UTF-8 text.")
+
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path or unsupported file type.")
 
     except PermissionError:
         raise HTTPException(
@@ -75,42 +89,107 @@ def scan_project_endpoint(request: ProjectScanRequest):
         )
 
 
-@router.post("/extract-from-ast")
-async def extract_metadata_from_ast_endpoint(
-    request: ASTMetadataRequest,
-):
-    """Extract metadata using AST from the TypeScript backend."""
-
+async def _remote(request: ASTMetadataRequest, client: ASTClient):
     try:
-        # Step 1: Retrieve AST document.
-        ast_document = await ast_client.get_ast_document(
-            request.project_id,
-            request.analysis_id,
-            request.artifact_id,
-        )
+        return await retrieve_ast_metadata(client, request.project_id, request.analysis_id, request.artifact_id)
+    except UpstreamError as error:
+        raise HTTPException(status_code=error.status_code,
+                            detail={"code": error.code, "message": error.message}) from error
+    except UnsupportedLanguageError as error:
+        raise HTTPException(status_code=422, detail={"code": "UNSUPPORTED_LANGUAGE",
+                            "message": "No verified AST adapter is available for this language."}) from error
+    except ASTValidationError as error:
+        raise HTTPException(status_code=502, detail={"code": "INVALID_AST_DOCUMENT",
+                            "message": "AST service returned invalid or incompatible data."}) from error
+    except ASTRequestError as error:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_AST_REQUEST",
+                            "message": "Invalid project, analysis, or artifact identifier."}) from error
+    except Exception as error:
+        logger.exception("Unexpected metadata extraction failure")
+        raise HTTPException(status_code=500, detail={"code": "METADATA_EXTRACTION_FAILED",
+                            "message": "Metadata extraction failed."}) from error
 
-        # Step 2: Extract metadata from AST.
-        metadata = extract_metadata_from_ast(ast_document)
 
-        return {
-            "status": "success",
-            "metadata": metadata,
-        }
+@router.post("/extract-from-ast")
+async def extract_metadata_from_ast_endpoint(request: ASTMetadataRequest, client: ASTClient = Depends(get_ast_client)):
+    document = await _remote(request, client)
+    return {"status": "success", "metadata": legacy_metadata(document)}
 
-    except httpx.HTTPStatusError as error:
-        raise HTTPException(
-            status_code=error.response.status_code,
-            detail="Failed to retrieve AST document from TypeScript backend.",
-        )
 
-    except httpx.RequestError:
-        raise HTTPException(
-            status_code=503,
-            detail="Cannot connect to the TypeScript backend.",
-        )
+@v2_router.post("/extract-from-ast", response_model=MetadataDocumentResponse)
+async def extract_metadata_document_endpoint(request: ASTMetadataRequest, client: ASTClient = Depends(get_ast_client)):
+    return MetadataDocumentResponse(metadata=await _remote(request, client))
 
-    except (ValueError, KeyError, TypeError) as error:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Metadata extraction failed: {error}",
-        )
+
+# Project endpoints return bounded outcomes/references; entity payloads stay per-file.
+from app.metadata.persistence import FileMetadataStore, MetadataStorageError
+from app.metadata.project_models import MetadataAnalysis
+from app.metadata.project_service import ProjectMetadataService, ProjectExtractionError
+from fastapi import Query
+
+
+def get_metadata_store():
+    return FileMetadataStore()
+
+
+def _project_http_error(error):
+    if isinstance(error, (MetadataStorageError, ProjectExtractionError, UpstreamError)):
+        code, status = error.code, error.status_code
+    elif isinstance(error, ASTRequestError):
+        code, status = 'INVALID_AST_REQUEST', 400
+    elif isinstance(error, ASTValidationError):
+        code, status = 'INVALID_UPSTREAM_ANALYSIS', 502
+    else:
+        logger.exception('Project metadata operation failed')
+        code, status = 'METADATA_OPERATION_FAILED', 500
+    messages = {
+        'METADATA_NOT_FOUND': 'Persisted metadata was not found.',
+        'METADATA_STORAGE_CORRUPT': 'Persisted metadata is corrupt.',
+        'METADATA_STORAGE_INCOMPATIBLE': 'Persisted metadata uses an unsupported version.',
+        'METADATA_EXTRACTION_BUSY': 'Metadata extraction capacity is busy; retry later.',
+        'UPSTREAM_ANALYSIS_NOT_READY': 'Upstream analysis must be completed before metadata extraction.',
+        'METADATA_ANALYSIS_CONFLICT': 'Stored metadata belongs to a different source snapshot.',
+    }
+    return HTTPException(status_code=status, detail={'code': code, 'message': messages.get(code, 'Metadata operation could not be completed.')})
+
+
+@v2_router.post('/projects/{project_id}/analyses/{analysis_id}/extract', response_model=MetadataAnalysis)
+async def extract_project_metadata_endpoint(project_id: str, analysis_id: str,
+        retry_failed: bool = Query(False), client: ASTClient = Depends(get_ast_client),
+        store: FileMetadataStore = Depends(get_metadata_store)):
+    try:
+        return await ProjectMetadataService(client, store).extract(project_id, analysis_id, retry_failed=retry_failed)
+    except Exception as error:
+        raise _project_http_error(error) from error
+
+
+@v2_router.get('/projects/{project_id}/analyses/{analysis_id}', response_model=MetadataAnalysis)
+def get_project_metadata_endpoint(project_id: str, analysis_id: str,
+        store: FileMetadataStore = Depends(get_metadata_store)):
+    try:
+        return store.load_analysis(project_id, analysis_id)
+    except Exception as error:
+        raise _project_http_error(error) from error
+
+
+@v2_router.get('/projects/{project_id}/analyses/{analysis_id}/files')
+def list_project_metadata_files_endpoint(project_id: str, analysis_id: str,
+        store: FileMetadataStore = Depends(get_metadata_store)):
+    try:
+        analysis = store.load_analysis(project_id, analysis_id)
+        return {'projectId': project_id, 'analysisId': analysis_id, 'files': analysis.files}
+    except Exception as error:
+        raise _project_http_error(error) from error
+
+
+@v2_router.get('/projects/{project_id}/analyses/{analysis_id}/files/{artifact_id}', response_model=MetadataDocumentResponse)
+def get_project_metadata_file_endpoint(project_id: str, analysis_id: str, artifact_id: str,
+        store: FileMetadataStore = Depends(get_metadata_store)):
+    try:
+        ASTClient._identity(project_id, analysis_id, artifact_id)
+        analysis = store.load_analysis(project_id, analysis_id)
+        if not any(f.metadataArtifact and f.metadataArtifact.artifactId == artifact_id for f in analysis.files):
+            raise MetadataStorageError('METADATA_NOT_FOUND', 404)
+        return MetadataDocumentResponse(metadata=store.load_file(project_id, analysis_id, artifact_id))
+    except Exception as error:
+        raise _project_http_error(error) from error

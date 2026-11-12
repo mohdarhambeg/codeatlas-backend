@@ -1,7 +1,7 @@
 
 from fastapi import FastAPI
 
-from app.metadata.routes import router as metadata_router
+from app.metadata.routes import router as metadata_router, v2_router as metadata_v2_router
 
 from app.quality.routes import router as quality_router
 
@@ -27,3 +27,4 @@ def health_check():
 
 app.include_router(metadata_router)
 app.include_router(quality_router)
+app.include_router(metadata_v2_router)

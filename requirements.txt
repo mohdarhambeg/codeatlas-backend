@@ -1,3 +1,5 @@
 fastapi
 uvicorn[standard]
 httpx
+# Metadata contracts use Pydantic v2 validators directly.
+pydantic>=2.9,<3

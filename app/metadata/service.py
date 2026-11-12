@@ -139,7 +139,9 @@ def scan_project(project_path: str) -> dict:
         ) as error:
             errors.append({
                 "file": str(file_path),
-                "error": str(error),
+                "error": (f"Invalid Python syntax at line {error.lineno}." if isinstance(error, SyntaxError)
+                          else "The file is not valid UTF-8 text." if isinstance(error, UnicodeDecodeError)
+                          else "Could not analyze the Python file."),
             })
 
     total_imports = sum(
@@ -173,3 +175,35 @@ def scan_project(project_path: str) -> dict:
         "results": results,
         "errors": errors,
     }
+
+
+def extract_ast_metadata(ast_document: object):
+    """Validate a normalized document and select its verified language adapter."""
+    from app.metadata.validation import validate_ast, select_language, ASTValidationError
+    from app.metadata.extractors.javascript import JavaScriptExtractor
+
+    document = validate_ast(ast_document)
+    select_language(document)
+    if next(n for n in document.nodes if n.id == document.rootId).type != 'program':
+        raise ASTValidationError('Unsupported JavaScript root')
+    return JavaScriptExtractor(document).extract()
+
+
+async def retrieve_ast_metadata(client, project_id: str, analysis_id: str, artifact_id: str):
+    """Match upstream identity before returning a syntax-only metadata snapshot."""
+    from hashlib import sha256
+    import json
+    from app.metadata.validation import validate_ast, ASTValidationError, NORMALIZATION
+
+    raw = await client.get_ast_document(project_id, analysis_id, artifact_id)
+    document = validate_ast(raw)
+    if document.projectId != project_id or document.analysisId != analysis_id:
+        raise ASTValidationError('AST identity mismatch')
+    descriptor = [document.schemaVersion, document.normalizationVersion or NORMALIZATION,
+                  document.projectId, document.analysisId, document.relativePath, document.contentHash,
+                  document.parserId, document.parserVersion, document.grammarVersion]
+    current = sha256(json.dumps(descriptor, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+    legacy = sha256(f'{document.schemaVersion}:{document.relativePath}:{document.contentHash}'.encode()).hexdigest()
+    if artifact_id not in (current, legacy):
+        raise ASTValidationError('AST artifact identity mismatch')
+    return extract_ast_metadata(document)

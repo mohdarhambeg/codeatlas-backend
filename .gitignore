@@ -15,3 +15,8 @@ venv/
 
 # VS Code workspace settings
 .vscode/
+
+# Persisted Python metadata documents
+/data/metadata/
+
+/docs

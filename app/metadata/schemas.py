@@ -45,3 +45,11 @@ class ASTMetadataRequest(BaseModel):
     project_id: str = Field(..., min_length=1)
     analysis_id: str = Field(..., min_length=1)
     artifact_id: str = Field(..., min_length=1)
+
+
+from app.metadata.models import MetadataDocument
+
+
+class MetadataDocumentResponse(BaseModel):
+    status: str = 'success'
+    metadata: MetadataDocument
